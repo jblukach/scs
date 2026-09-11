@@ -1,5 +1,16 @@
 # AWS Certified Security - Specialty (SCS-C03)
 
+AWS CDK stack that deploys a manually invoked Lambda function which downloads the AWS documentation PDFs listed below into the `scs-use2-lukach-io` bucket.
+
+```
+cdk deploy
+aws lambda invoke --function-name scs-download --region us-east-2 response.json
+```
+
+Objects are stored as `<service>/<filename>.pdf` and overwritten on every invoke.
+
+## Exam Guide
+
 https://docs.aws.amazon.com/pdfs/aws-certification/latest/security-specialty-03/security-specialty-03.pdf
 
 Analytics
