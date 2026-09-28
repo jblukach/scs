@@ -2,7 +2,7 @@
 
 An AWS CDK project that collects the official AWS documentation PDFs relevant to the **AWS Certified Security - Specialty (SCS-C03)** exam.
 
-The stack creates a private S3 bucket and a manually invoked Lambda function. Each invocation downloads the PDFs in `download/download.py` and stores them under `<service>/<filename>.pdf`.
+The stack creates a private S3 bucket and a manually invoked Lambda function. Each invocation downloads the PDFs in `download/download.py` and stores them under `<service>/<filename>.pdf`. A second manually invoked Lambda copies those files into the PDF upload bucket, where a container Lambda converts uploaded PDFs to Markdown in a separate bucket.
 
 ## What it deploys
 
@@ -10,6 +10,10 @@ The stack creates a private S3 bucket and a manually invoked Lambda function. Ea
 | --- | --- |
 | S3 bucket | `scs-use2-lukach-io`, S3-managed encryption, public access blocked, SSL required |
 | Lambda function | `scs-download`, Python 3.13, ARM64, 15-minute timeout, 1 GiB memory |
+| Copy Lambda | `scs-pdf2md`, Python 3.13, ARM64, copies all objects from the SCS bucket into the PDF bucket |
+| PDF bucket | `pdf-use2-lukach-io`, private S3 bucket for manually uploaded PDFs |
+| Markdown bucket | `md-use2-lukach-io`, private S3 bucket for converted Markdown |
+| Container Lambda | `pdf2md`, Python 3.13 image with `pymupdf4llm`, x86_64, 15-minute timeout, 2 GiB memory and temporary storage |
 | CloudWatch Logs | `/aws/lambda/scs-download`, one-month retention |
 
 The bucket is configured for removal on stack deletion. Downloaded objects are replaced when the function runs again.
@@ -19,6 +23,7 @@ The bucket is configured for removal on stack deletion. Downloaded objects are r
 - AWS credentials configured for an account where you can deploy CDK resources
 - AWS CDK v2 and Python 3.13+
 - Node.js, required by the AWS CDK CLI
+- Docker, running locally for the CDK container-image build
 - An existing `packages-use2-lukach-io` bucket containing `requests.zip`
 
 The Lambda layer expects `requests.zip` to contain the `requests` dependency and to be compatible with Python 3.13 on ARM64.
@@ -34,7 +39,7 @@ cdk bootstrap
 cdk deploy
 ```
 
-The app is pinned to `us-east-2` in `app.py`. The deployment creates the bucket and Lambda function but does not download the documents automatically.
+The app is pinned to `us-east-2` in `app.py`. Deployment does not download, copy, or convert documents until the corresponding Lambda is invoked or a PDF is uploaded.
 
 ## Download the documents
 
@@ -66,14 +71,45 @@ aws s3 ls s3://scs-use2-lukach-io/ --recursive
 aws s3 sync s3://scs-use2-lukach-io/ ./pdfs
 ```
 
+## Copy the documents for conversion
+
+After downloading the PDFs, invoke the copy Lambda to copy every object in the SCS bucket into the PDF bucket without changing its key or folder path:
+
+```bash
+aws lambda invoke \
+  --function-name scs-pdf2md \
+  --region us-east-2 \
+  response.json
+
+cat response.json
+```
+
+Each copied PDF triggers the `pdf2md` container Lambda. Non-PDF objects are also copied, but ignored by the converter. Re-invoking the copy Lambda overwrites existing destination objects and triggers conversion again. The copy is limited to a single Lambda invocation (15 minutes); for a much larger bucket, use a batch workflow instead.
+
+## Convert a PDF to Markdown
+
+Upload a PDF to the input bucket (uploads and copies both trigger conversion):
+
+```bash
+aws s3 cp ./input.pdf s3://pdf-use2-lukach-io/guides/input.pdf --region us-east-2
+aws s3 cp s3://md-use2-lukach-io/guides/input.md ./input.md --region us-east-2
+```
+
+The Lambda writes the converted Markdown under the same folder path, replacing the `.pdf` extension with `.md`. Other uploaded file types are ignored. Existing Markdown at that key is overwritten if the PDF is uploaded again. The PDF and Markdown buckets are deleted with their contents when the stack is destroyed.
+
 ## Project layout
 
 ```text
 .
 ├── app.py                 # CDK application entry point
 ├── cdk.json               # CDK CLI configuration
+├── copypdfs/copypdfs.py   # SCS-to-PDF bucket copy Lambda
 ├── download/download.py   # Lambda handler and document manifest
+├── pdf2md/Dockerfile      # Container Lambda image with pymupdf4llm
+├── pdf2md/pdf2md.py      # S3 event handler and PDF conversion
 ├── scs/scs_stack.py       # Infrastructure definition
+├── tests/test_copypdfs.py # Bucket copy test
+├── tests/test_pdf2md.py  # Conversion event test
 └── requirements.txt       # Python dependencies
 ```
 

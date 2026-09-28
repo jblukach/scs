@@ -3,11 +3,14 @@ import datetime
 from aws_cdk import (
     Duration,
     RemovalPolicy,
+    Size,
     Stack,
+    aws_ecr_assets as _ecr_assets,
     aws_iam as _iam,
     aws_lambda as _lambda,
     aws_logs as _logs,
-    aws_s3 as _s3
+    aws_s3 as _s3,
+    aws_s3_notifications as _s3n
 )
 
 from constructs import Construct
@@ -32,6 +35,26 @@ class ScsStack(Stack):
         bucket = _s3.Bucket(
             self, 'bucket',
             bucket_name = 'scs-use2-lukach-io',
+            encryption = _s3.BucketEncryption.S3_MANAGED,
+            block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl = True,
+            removal_policy = RemovalPolicy.DESTROY,
+            auto_delete_objects = True
+        )
+
+        pdf_bucket = _s3.Bucket(
+            self, 'pdf_bucket',
+            bucket_name = 'pdf-use2-lukach-io',
+            encryption = _s3.BucketEncryption.S3_MANAGED,
+            block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl = True,
+            removal_policy = RemovalPolicy.DESTROY,
+            auto_delete_objects = True
+        )
+
+        md_bucket = _s3.Bucket(
+            self, 'md_bucket',
+            bucket_name = 'md-use2-lukach-io',
             encryption = _s3.BucketEncryption.S3_MANAGED,
             block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl = True,
@@ -105,6 +128,61 @@ class ScsStack(Stack):
         logs = _logs.LogGroup(
             self, 'logs',
             log_group_name = '/aws/lambda/'+download.function_name,
+            retention = _logs.RetentionDays.ONE_MONTH,
+            removal_policy = RemovalPolicy.DESTROY
+        )
+
+        copypdfs = _lambda.Function(
+            self, 'copypdfs',
+            function_name = 'scs-pdf2md',
+            runtime = _lambda.Runtime.PYTHON_3_13,
+            architecture = _lambda.Architecture.ARM_64,
+            code = _lambda.Code.from_asset('copypdfs'),
+            handler = 'copypdfs.handler',
+            environment = dict(
+                SOURCE_BUCKET = bucket.bucket_name,
+                DESTINATION_BUCKET = pdf_bucket.bucket_name
+            ),
+            timeout = Duration.seconds(900),
+            memory_size = 1024
+        )
+
+        bucket.grant_read(copypdfs)
+        pdf_bucket.grant_put(copypdfs)
+
+        _logs.LogGroup(
+            self, 'copypdfs_logs',
+            log_group_name = '/aws/lambda/'+copypdfs.function_name,
+            retention = _logs.RetentionDays.ONE_MONTH,
+            removal_policy = RemovalPolicy.DESTROY
+        )
+
+        pdf2md = _lambda.DockerImageFunction(
+            self, 'pdf2md',
+            function_name = 'pdf2md',
+            code = _lambda.DockerImageCode.from_image_asset(
+                'pdf2md',
+                platform = _ecr_assets.Platform.LINUX_AMD64
+            ),
+            architecture = _lambda.Architecture.X86_64,
+            environment = dict(
+                MD_BUCKET = md_bucket.bucket_name
+            ),
+            timeout = Duration.seconds(900),
+            memory_size = 2048,
+            ephemeral_storage_size = Size.mebibytes(2048)
+        )
+
+        pdf_bucket.grant_read(pdf2md)
+        md_bucket.grant_put(pdf2md)
+        pdf_bucket.add_event_notification(
+            _s3.EventType.OBJECT_CREATED,
+            _s3n.LambdaDestination(pdf2md)
+        )
+
+        _logs.LogGroup(
+            self, 'pdf2md_logs',
+            log_group_name = '/aws/lambda/'+pdf2md.function_name,
             retention = _logs.RetentionDays.ONE_MONTH,
             removal_policy = RemovalPolicy.DESTROY
         )
