@@ -169,8 +169,8 @@ class ScsStack(Stack):
                 MD_BUCKET = md_bucket.bucket_name
             ),
             timeout = Duration.seconds(900),
-            memory_size = 2048,
-            ephemeral_storage_size = Size.mebibytes(2048)
+            memory_size = 4096,
+            ephemeral_storage_size = Size.mebibytes(4096)
         )
 
         pdf_bucket.grant_read(pdf2md)
