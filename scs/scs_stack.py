@@ -76,6 +76,16 @@ class ScsStack(Stack):
             auto_delete_objects = True
         )
 
+        chunk_bucket = _s3.Bucket(
+            self, 'chunk_bucket',
+            bucket_name = 'chunk-use2-lukach-io',
+            encryption = _s3.BucketEncryption.S3_MANAGED,
+            block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl = True,
+            removal_policy = RemovalPolicy.DESTROY,
+            auto_delete_objects = True
+        )
+
     ### LAMBDA LAYER ###
 
         requests = _lambda.LayerVersion(
@@ -200,6 +210,31 @@ class ScsStack(Stack):
         _logs.LogGroup(
             self, 'raw2split_logs',
             log_group_name = '/aws/lambda/'+raw2split.function_name,
+            retention = _logs.RetentionDays.ONE_MONTH,
+            removal_policy = RemovalPolicy.DESTROY
+        )
+
+        text2chunk = _lambda.Function(
+            self, 'text2chunk',
+            function_name = 'text2chunk',
+            runtime = _lambda.Runtime.PYTHON_3_13,
+            architecture = _lambda.Architecture.ARM_64,
+            code = _lambda.Code.from_asset('text2chunk'),
+            handler = 'text2chunk.handler',
+            environment = dict(
+                MD_BUCKET = md_bucket.bucket_name,
+                CHUNK_BUCKET = chunk_bucket.bucket_name
+            ),
+            timeout = Duration.seconds(900),
+            memory_size = 3008
+        )
+
+        md_bucket.grant_read(text2chunk)
+        chunk_bucket.grant_put(text2chunk)
+
+        _logs.LogGroup(
+            self, 'text2chunk_logs',
+            log_group_name = '/aws/lambda/'+text2chunk.function_name,
             retention = _logs.RetentionDays.ONE_MONTH,
             removal_policy = RemovalPolicy.DESTROY
         )

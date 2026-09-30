@@ -2,7 +2,7 @@
 
 An AWS CDK project that collects the official AWS documentation PDFs relevant to the **AWS Certified Security - Specialty (SCS-C03)** exam.
 
-The stack creates a private S3 bucket and a manually invoked Lambda function. Each invocation downloads the PDFs in `download/download.py` and stores them at the bucket root with names based on the study guide titles below, such as `amazon-guardduty.pdf`. A container Lambda converts PDFs uploaded to a separate PDF bucket into Markdown in a third bucket, and another container Lambda splits PDFs uploaded to a raw bucket into 1,000-page parts in a split bucket.
+The stack creates a private S3 bucket and a manually invoked Lambda function. Each invocation downloads the PDFs in `download/download.py` and stores them at the bucket root with names based on the study guide titles below, such as `amazon-guardduty.pdf`. A container Lambda converts PDFs uploaded to a separate PDF bucket into Markdown in a third bucket, another container Lambda splits PDFs uploaded to a raw bucket into 1,000-page parts in a split bucket, and a fourth Lambda chunks Markdown into a chunk bucket ready for summarization.
 
 ## What it deploys
 
@@ -16,7 +16,9 @@ The stack creates a private S3 bucket and a manually invoked Lambda function. Ea
 | Raw bucket | `raw-use2-lukach-io`, private S3 bucket for large PDFs awaiting a split |
 | Split bucket | `split-use2-lukach-io`, private S3 bucket for the split PDF parts |
 | Container Lambda | `raw2split`, Python 3.13 image with `pymupdf`, x86_64, 15-minute timeout, 4 GiB memory |
-| CloudWatch Logs | `/aws/lambda/scs-download`, `/aws/lambda/pdf2md`, and `/aws/lambda/raw2split`, one-month retention |
+| Chunk bucket | `chunk-use2-lukach-io`, private S3 bucket for the Markdown chunks |
+| Lambda function | `text2chunk`, Python 3.13, ARM64, 15-minute timeout, 3 GiB memory |
+| CloudWatch Logs | `/aws/lambda/scs-download`, `/aws/lambda/pdf2md`, `/aws/lambda/raw2split`, and `/aws/lambda/text2chunk`, one-month retention |
 
 The bucket is configured for removal on stack deletion. Downloaded objects are replaced when the function runs again.
 
@@ -95,6 +97,34 @@ aws s3 ls s3://split-use2-lukach-io/ --region us-east-2
 
 The Lambda splits the document into parts of 1,000 pages at most and writes them to the root of the split bucket, dropping any folder prefix. Each part keeps the source file name with a four-digit suffix, such as `large-0001.pdf` and `large-0002.pdf`, so sorting by name preserves the original page order. Documents of 1,000 pages or fewer still produce a single `-0001.pdf` part. Non-PDF uploads are ignored, and identically named PDFs in different raw folders overwrite each other in the split bucket.
 
+## Chunk the Markdown
+
+`text2chunk` runs automatically when `pdf2md` writes a `.md` object to the Markdown bucket. Invoke it without a payload to reprocess every `.md` object already in the bucket, eight files at a time:
+
+```bash
+aws lambda invoke \
+  --function-name text2chunk \
+  --region us-east-2 \
+  response.json
+
+aws s3 ls s3://chunk-use2-lukach-io/ --region us-east-2
+```
+
+The Lambda walks the Markdown at `# ` and `## ` headings and fills each chunk up to 15,000 characters, roughly 3,000 words, before breaking at the next heading. Short sections are packed together rather than written out as their own tiny objects, so a document produces far fewer, more complete chunks. A section larger than the limit is broken down at `### ` and deeper headings, then paragraphs, then lines, and every continuation carries its parent heading as `# Heading (continued)` so the context is not lost. Markdown tables and fenced code blocks are treated as single units, so a break never lands between a table header and its rows.
+
+Every chunk opens with a blockquote preamble naming the source object, the document title, the current section, and the chunk position, which keeps a chunk self-describing for a downstream summarizer that sees it in isolation:
+
+```markdown
+> Source: guides/amazon-guardduty-0001.md
+> Document: Amazon GuardDuty User Guide
+> Section: Managing findings
+> Chunk 47 of 132
+```
+
+Chunks are written to the root of the chunk bucket with no folders. Each chunk keeps the source file name with a four-digit suffix, such as `large-0001-0001.md`, so a Markdown file that already carries a split suffix gains a second one and sorting by name still preserves the original order. Non-Markdown objects are ignored, and identically named Markdown files in different folders overwrite each other in the chunk bucket.
+
+Each file is downloaded to a private directory under `/tmp` that is removed after its chunks are uploaded, so the function's scratch space stays empty between files.
+
 ## Project layout
 
 ```text
@@ -106,9 +136,11 @@ The Lambda splits the document into parts of 1,000 pages at most and writes them
 ├── pdf2md/pdf2md.py      # S3 event handler and PDF conversion
 ├── raw2split/Dockerfile   # Container Lambda image with pymupdf
 ├── raw2split/raw2split.py # S3 event handler and PDF splitting
+├── text2chunk/text2chunk.py # Markdown chunking handler
 ├── scs/scs_stack.py       # Infrastructure definition
 ├── tests/test_pdf2md.py  # Conversion event test
 ├── tests/test_raw2split.py # Split event test
+├── tests/test_text2chunk.py # Chunking test
 └── requirements.txt       # Python dependencies
 ```
 
