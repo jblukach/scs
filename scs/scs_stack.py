@@ -3,7 +3,6 @@ import datetime
 from aws_cdk import (
     Duration,
     RemovalPolicy,
-    Size,
     Stack,
     aws_ecr_assets as _ecr_assets,
     aws_iam as _iam,
@@ -19,11 +18,6 @@ class ScsStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
-
-        now = datetime.datetime.now()
-        year = now.year
-        month = now.strftime('%m')
-        day = now.strftime('%d')
 
     ### S3 BUCKETS ###
 
@@ -67,7 +61,7 @@ class ScsStack(Stack):
         requests = _lambda.LayerVersion(
             self, 'requests',
             layer_version_name = 'requests',
-            description = str(year)+'-'+str(month)+'-'+str(day)+' deployment',
+            description = datetime.date.today().isoformat()+' deployment',
             code = _lambda.Code.from_bucket(
                 bucket = packages,
                 key = 'requests.zip'
@@ -125,34 +119,9 @@ class ScsStack(Stack):
             ]
         )
 
-        logs = _logs.LogGroup(
+        _logs.LogGroup(
             self, 'logs',
             log_group_name = '/aws/lambda/'+download.function_name,
-            retention = _logs.RetentionDays.ONE_MONTH,
-            removal_policy = RemovalPolicy.DESTROY
-        )
-
-        copypdfs = _lambda.Function(
-            self, 'copypdfs',
-            function_name = 'scs-pdf2md',
-            runtime = _lambda.Runtime.PYTHON_3_13,
-            architecture = _lambda.Architecture.ARM_64,
-            code = _lambda.Code.from_asset('copypdfs'),
-            handler = 'copypdfs.handler',
-            environment = dict(
-                SOURCE_BUCKET = bucket.bucket_name,
-                DESTINATION_BUCKET = pdf_bucket.bucket_name
-            ),
-            timeout = Duration.seconds(900),
-            memory_size = 1024
-        )
-
-        bucket.grant_read(copypdfs)
-        pdf_bucket.grant_put(copypdfs)
-
-        _logs.LogGroup(
-            self, 'copypdfs_logs',
-            log_group_name = '/aws/lambda/'+copypdfs.function_name,
             retention = _logs.RetentionDays.ONE_MONTH,
             removal_policy = RemovalPolicy.DESTROY
         )
@@ -169,8 +138,7 @@ class ScsStack(Stack):
                 MD_BUCKET = md_bucket.bucket_name
             ),
             timeout = Duration.seconds(900),
-            memory_size = 4096,
-            ephemeral_storage_size = Size.mebibytes(4096)
+            memory_size = 4096
         )
 
         pdf_bucket.grant_read(pdf2md)
