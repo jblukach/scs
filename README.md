@@ -2,7 +2,7 @@
 
 An AWS CDK project that collects the official AWS documentation PDFs relevant to the **AWS Certified Security - Specialty (SCS-C03)** exam.
 
-The stack creates a private S3 bucket and a manually invoked Lambda function. Each invocation downloads the PDFs in `download/download.py` and stores them at the bucket root with names based on the study guide titles below, such as `amazon-guardduty.pdf`. A container Lambda converts PDFs uploaded to a separate PDF bucket into Markdown in a third bucket.
+The stack creates a private S3 bucket and a manually invoked Lambda function. Each invocation downloads the PDFs in `download/download.py` and stores them at the bucket root with names based on the study guide titles below, such as `amazon-guardduty.pdf`. A container Lambda converts PDFs uploaded to a separate PDF bucket into Markdown in a third bucket, and another container Lambda splits PDFs uploaded to a raw bucket into 1,000-page parts in a split bucket.
 
 ## What it deploys
 
@@ -13,7 +13,10 @@ The stack creates a private S3 bucket and a manually invoked Lambda function. Ea
 | PDF bucket | `pdf-use2-lukach-io`, private S3 bucket for manually uploaded PDFs |
 | Markdown bucket | `md-use2-lukach-io`, private S3 bucket for converted Markdown |
 | Container Lambda | `pdf2md`, Python 3.13 image with `pymupdf4llm`, x86_64, 15-minute timeout, 4 GiB memory |
-| CloudWatch Logs | `/aws/lambda/scs-download` and `/aws/lambda/pdf2md`, one-month retention |
+| Raw bucket | `raw-use2-lukach-io`, private S3 bucket for large PDFs awaiting a split |
+| Split bucket | `split-use2-lukach-io`, private S3 bucket for the split PDF parts |
+| Container Lambda | `raw2split`, Python 3.13 image with `pymupdf`, x86_64, 15-minute timeout, 4 GiB memory |
+| CloudWatch Logs | `/aws/lambda/scs-download`, `/aws/lambda/pdf2md`, and `/aws/lambda/raw2split`, one-month retention |
 
 The bucket is configured for removal on stack deletion. Downloaded objects are replaced when the function runs again.
 
@@ -81,6 +84,17 @@ aws s3 cp s3://md-use2-lukach-io/guides/input.md ./input.md --region us-east-2
 
 The Lambda writes the converted Markdown under the same folder path, replacing the `.pdf` extension with `.md`. Other uploaded file types are ignored. Existing Markdown at that key is overwritten if the PDF is uploaded again. The PDF and Markdown buckets are deleted with their contents when the stack is destroyed.
 
+## Split a large PDF
+
+Upload a PDF to the raw bucket to trigger `raw2split`:
+
+```bash
+aws s3 cp ./large.pdf s3://raw-use2-lukach-io/guides/large.pdf --region us-east-2
+aws s3 ls s3://split-use2-lukach-io/ --region us-east-2
+```
+
+The Lambda splits the document into parts of 1,000 pages at most and writes them to the root of the split bucket, dropping any folder prefix. Each part keeps the source file name with a four-digit suffix, such as `large-0001.pdf` and `large-0002.pdf`, so sorting by name preserves the original page order. Documents of 1,000 pages or fewer still produce a single `-0001.pdf` part. Non-PDF uploads are ignored, and identically named PDFs in different raw folders overwrite each other in the split bucket.
+
 ## Project layout
 
 ```text
@@ -90,8 +104,11 @@ The Lambda writes the converted Markdown under the same folder path, replacing t
 ├── download/download.py   # Lambda handler and document manifest
 ├── pdf2md/Dockerfile      # Container Lambda image with pymupdf4llm
 ├── pdf2md/pdf2md.py      # S3 event handler and PDF conversion
+├── raw2split/Dockerfile   # Container Lambda image with pymupdf
+├── raw2split/raw2split.py # S3 event handler and PDF splitting
 ├── scs/scs_stack.py       # Infrastructure definition
 ├── tests/test_pdf2md.py  # Conversion event test
+├── tests/test_raw2split.py # Split event test
 └── requirements.txt       # Python dependencies
 ```
 

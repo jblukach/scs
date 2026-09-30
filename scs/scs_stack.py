@@ -56,6 +56,26 @@ class ScsStack(Stack):
             auto_delete_objects = True
         )
 
+        raw_bucket = _s3.Bucket(
+            self, 'raw_bucket',
+            bucket_name = 'raw-use2-lukach-io',
+            encryption = _s3.BucketEncryption.S3_MANAGED,
+            block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl = True,
+            removal_policy = RemovalPolicy.DESTROY,
+            auto_delete_objects = True
+        )
+
+        split_bucket = _s3.Bucket(
+            self, 'split_bucket',
+            bucket_name = 'split-use2-lukach-io',
+            encryption = _s3.BucketEncryption.S3_MANAGED,
+            block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl = True,
+            removal_policy = RemovalPolicy.DESTROY,
+            auto_delete_objects = True
+        )
+
     ### LAMBDA LAYER ###
 
         requests = _lambda.LayerVersion(
@@ -151,6 +171,35 @@ class ScsStack(Stack):
         _logs.LogGroup(
             self, 'pdf2md_logs',
             log_group_name = '/aws/lambda/'+pdf2md.function_name,
+            retention = _logs.RetentionDays.ONE_MONTH,
+            removal_policy = RemovalPolicy.DESTROY
+        )
+
+        raw2split = _lambda.DockerImageFunction(
+            self, 'raw2split',
+            function_name = 'raw2split',
+            code = _lambda.DockerImageCode.from_image_asset(
+                'raw2split',
+                platform = _ecr_assets.Platform.LINUX_AMD64
+            ),
+            architecture = _lambda.Architecture.X86_64,
+            environment = dict(
+                SPLIT_BUCKET = split_bucket.bucket_name
+            ),
+            timeout = Duration.seconds(900),
+            memory_size = 4096
+        )
+
+        raw_bucket.grant_read(raw2split)
+        split_bucket.grant_put(raw2split)
+        raw_bucket.add_event_notification(
+            _s3.EventType.OBJECT_CREATED,
+            _s3n.LambdaDestination(raw2split)
+        )
+
+        _logs.LogGroup(
+            self, 'raw2split_logs',
+            log_group_name = '/aws/lambda/'+raw2split.function_name,
             retention = _logs.RetentionDays.ONE_MONTH,
             removal_policy = RemovalPolicy.DESTROY
         )
