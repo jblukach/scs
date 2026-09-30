@@ -4,6 +4,17 @@ An AWS CDK project that collects the official AWS documentation PDFs relevant to
 
 The stack creates a private S3 bucket and a manually invoked Lambda function. Each invocation downloads the PDFs in `download/download.py` and stores them at the bucket root with names based on the study guide titles below, such as `amazon-guardduty.pdf`. A container Lambda converts PDFs uploaded to a separate PDF bucket into Markdown in a third bucket, another container Lambda splits PDFs uploaded to a raw bucket into 1,000-page parts in a split bucket, and a fourth Lambda chunks Markdown into a chunk bucket ready for summarization.
 
+## Overview
+
+This repository turns the official AWS documentation set for the AWS Certified Security - Specialty exam into a simple, repeatable S3-and-Lambda pipeline. The workflow is intentionally small:
+
+1. Download the latest PDF manifest from the AWS documentation catalog into the study bucket.
+2. Convert any uploaded source PDFs into Markdown for easier downstream processing.
+3. Split very large PDFs into numbered parts so they remain manageable for downstream workloads.
+4. Chunk Markdown into section-aware, size-limited fragments for summarization and retrieval.
+
+The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with source handlers kept under `download/`, `pdf2md/`, `raw2split/`, and `text2chunk/`.
+
 ## What it deploys
 
 | Resource | Configuration |
@@ -146,7 +157,7 @@ Each file is downloaded to a private directory under `/tmp` that is removed afte
 
 ## Study guide
 
-The manifest contains the exam guide plus the following official AWS documentation. Links open the PDFs directly from AWS.
+The manifest contains the exam guide plus the following official AWS documentation. Links open the PDFs directly from AWS and match the current manifest in `download/download.py`.
 
 <details>
 <summary><strong>Exam guide</strong></summary>
@@ -219,14 +230,14 @@ The manifest contains the exam guide plus the following official AWS documentati
 - [Amazon EventBridge](https://docs.aws.amazon.com/pdfs/eventbridge/latest/userguide/user-guide.pdf)
 - [AWS Config](https://docs.aws.amazon.com/pdfs/config/latest/developerguide/config-dg.pdf)
 - [AWS Control Tower](https://docs.aws.amazon.com/pdfs/controltower/latest/userguide/controltower-ug.pdf)
-- [Amazon Managed Grafana](https://docs.aws.amazon.com/pdfs/grafana/latest/userguide/service-guide.pdf.pdf)
+- [Amazon Managed Grafana](https://docs.aws.amazon.com/pdfs/grafana/latest/userguide/service-guide.pdf)
 - [AWS Organizations](https://docs.aws.amazon.com/pdfs/organizations/latest/userguide/organizations-userguide.pdf)
 - [AWS Resilience Hub](https://docs.aws.amazon.com/pdfs/resilience-hub/latest/userguide/resilience-hub-guide.pdf)
 - [AWS Resource Explorer](https://docs.aws.amazon.com/pdfs/resource-explorer/latest/userguide/resource_explorer_ug.pdf)
 - [AWS Service Catalog](https://docs.aws.amazon.com/pdfs/servicecatalog/latest/adminguide/service-catalog-ag.pdf)
 - [AWS Systems Manager](https://docs.aws.amazon.com/pdfs/systems-manager/latest/userguide/systems-manager-ug.pdf)
 - [AWS Trusted Advisor](https://docs.aws.amazon.com/pdfs/awssupport/latest/user/support-ug.pdf)
-- [AWS User Notifications](https://docs.aws.amazon.com/pdfs/notifications/latest/userguide/notifications-guide.pdf.pdf)
+- [AWS User Notifications](https://docs.aws.amazon.com/pdfs/notifications/latest/userguide/notifications-guide.pdf)
 - [AWS Well-Architected Tool](https://docs.aws.amazon.com/pdfs/wellarchitected/latest/userguide/wellarchitected-ug.pdf)
 
 </details>
@@ -234,7 +245,7 @@ The manifest contains the exam guide plus the following official AWS documentati
 <details>
 <summary><strong>Networking and Content Delivery</strong></summary>
 
-- [Amazon Application Recovery Controller](https://docs.aws.amazon.com/pdfs/r53recovery/latest/dg/r53-recovery-guide.pdf.pdf)
+- [Amazon Application Recovery Controller](https://docs.aws.amazon.com/pdfs/r53recovery/latest/dg/r53-recovery-guide.pdf)
 - [Amazon VPC](https://docs.aws.amazon.com/pdfs/vpc/latest/userguide/vpc-ug.pdf)
 - [AWS Site-to-Site VPN](https://docs.aws.amazon.com/pdfs/vpn/latest/s2svpn/s2s-vpn-user-guide.pdf)
 - [AWS Verified Access](https://docs.aws.amazon.com/pdfs/verified-access/latest/ug/verified-access-ug.pdf)
@@ -249,7 +260,7 @@ The manifest contains the exam guide plus the following official AWS documentati
 </details>
 
 <details>
-<summary><strong>Security, Identity, and Compliance</strong></summary>
+<summary><strong>Security</strong></summary>
 
 - [AWS Artifact](https://docs.aws.amazon.com/pdfs/artifact/latest/ug/artifact-ug.pdf)
 - [AWS Audit Manager](https://docs.aws.amazon.com/pdfs/audit-manager/latest/userguide/audit-manager-ug.pdf)
@@ -274,7 +285,7 @@ The manifest contains the exam guide plus the following official AWS documentati
 </details>
 
 <details>
-<summary><strong>Storage and Data Management</strong></summary>
+<summary><strong>Storage</strong></summary>
 
 - [Amazon S3](https://docs.aws.amazon.com/pdfs/AmazonS3/latest/userguide/s3-userguide.pdf)
 - [AWS Backup](https://docs.aws.amazon.com/pdfs/aws-backup/latest/devguide/AWSBackup-dg.pdf)
