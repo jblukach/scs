@@ -2,16 +2,16 @@
 
 An AWS CDK project that collects the official AWS documentation PDFs relevant to the **AWS Certified Security - Specialty (SCS-C03)** exam.
 
-The stack creates a private S3 bucket and a manually invoked Lambda function. Each invocation downloads the PDFs in `download/download.py` and stores them at the bucket root with names based on the study guide titles below, such as `amazon-guardduty.pdf`. A container Lambda converts PDFs uploaded to a separate PDF bucket into Markdown in a third bucket, another container Lambda splits PDFs uploaded to a raw bucket into 1,000-page parts in a split bucket, and a fourth Lambda chunks Markdown into a chunk bucket ready for summarization.
+The stack creates private S3 buckets and four Lambda functions. The `scs-download` function is invoked manually to download the PDFs in `download/download.py` into the study bucket. Uploading a PDF to the PDF bucket triggers conversion to Markdown, and uploading one to the raw bucket triggers splitting into parts of up to 1,000 pages. The `text2chunk` function is invoked separately to chunk Markdown from the Markdown bucket; the deployed stack does not trigger it automatically when Markdown is created.
 
 ## Overview
 
 This repository turns the official AWS documentation set for the AWS Certified Security - Specialty exam into a simple, repeatable S3-and-Lambda pipeline. The workflow is intentionally small:
 
-1. Download the latest PDF manifest from the AWS documentation catalog into the study bucket.
-2. Convert any uploaded source PDFs into Markdown for easier downstream processing.
-3. Split very large PDFs into numbered parts so they remain manageable for downstream workloads.
-4. Chunk Markdown into section-aware, size-limited fragments for summarization and retrieval.
+1. Manually invoke the downloader to fetch the PDFs listed in `download/download.py` into the study bucket.
+2. Upload source PDFs to the PDF bucket to trigger Markdown conversion.
+3. Upload large source PDFs to the raw bucket to trigger splitting into numbered parts. This is an independent path; the split bucket does not trigger another Lambda.
+4. Manually invoke the chunker to process Markdown in the Markdown bucket into section-aware, size-limited fragments for summarization and retrieval.
 
 The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with source handlers kept under `download/`, `pdf2md/`, `raw2split/`, and `text2chunk/`.
 
@@ -28,10 +28,10 @@ The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with 
 | Split bucket | `split-use2-lukach-io`, private S3 bucket for the split PDF parts |
 | Container Lambda | `raw2split`, Python 3.13 image with `pymupdf`, x86_64, 15-minute timeout, 4 GiB memory |
 | Chunk bucket | `chunk-use2-lukach-io`, private S3 bucket for the Markdown chunks |
-| Lambda function | `text2chunk`, Python 3.13, ARM64, 15-minute timeout, 3 GiB memory |
+| Lambda function | `text2chunk`, Python 3.13, ARM64, 15-minute timeout, 3,008 MiB memory |
 | CloudWatch Logs | `/aws/lambda/scs-download`, `/aws/lambda/pdf2md`, `/aws/lambda/raw2split`, and `/aws/lambda/text2chunk`, one-month retention |
 
-The bucket is configured for removal on stack deletion. Downloaded objects are replaced when the function runs again.
+All six buckets and their contents are configured for removal when the stack is destroyed. Downloaded objects are replaced when the downloader runs again.
 
 ## Prerequisites
 
@@ -39,7 +39,7 @@ The bucket is configured for removal on stack deletion. Downloaded objects are r
 - AWS CDK v2 and Python 3.13+
 - Node.js, required by the AWS CDK CLI
 - Docker, running locally for the CDK container-image build
-- An existing `packages-use2-lukach-io` bucket containing `requests.zip`
+- An existing `packages-use2-lukach-io` bucket in the deployment account and `us-east-2` region, containing `requests.zip`
 
 The Lambda layer expects `requests.zip` to contain the `requests` dependency and to be compatible with Python 3.13 on ARM64.
 
@@ -50,11 +50,11 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-cdk bootstrap
+cdk bootstrap aws://ACCOUNT/us-east-2 --qualifier lukach
 cdk deploy
 ```
 
-The app is pinned to `us-east-2` in `app.py`. Deployment does not download or convert documents until the corresponding Lambda is invoked or a PDF is uploaded.
+Replace `ACCOUNT` with the AWS account ID used for deployment. The stack is pinned to `us-east-2` and uses the CDK asset qualifier `lukach`, so the bootstrap environment must use that same qualifier. Deployment does not download or convert documents: the downloader and chunker are manually invoked, while PDF conversion and splitting start only after an object is uploaded to their respective input buckets.
 
 ## Download the documents
 
@@ -110,7 +110,7 @@ The Lambda splits the document into parts of 1,000 pages at most and writes them
 
 ## Chunk the Markdown
 
-`text2chunk` runs automatically when `pdf2md` writes a `.md` object to the Markdown bucket. Invoke it without a payload to reprocess every `.md` object already in the bucket, eight files at a time:
+`text2chunk` is not wired to an S3 notification in this stack. Invoke it without a payload to scan and process every `.md` object already in the Markdown bucket, with up to eight files processed concurrently:
 
 ```bash
 aws lambda invoke \
@@ -121,9 +121,9 @@ aws lambda invoke \
 aws s3 ls s3://chunk-use2-lukach-io/ --region us-east-2
 ```
 
-The Lambda walks the Markdown at `# ` and `## ` headings and fills each chunk up to 15,000 characters, roughly 3,000 words, before breaking at the next heading. Short sections are packed together rather than written out as their own tiny objects, so a document produces far fewer, more complete chunks. A section larger than the limit is broken down at `### ` and deeper headings, then paragraphs, then lines, and every continuation carries its parent heading as `# Heading (continued)` so the context is not lost. Markdown tables and fenced code blocks are treated as single units, so a break never lands between a table header and its rows.
+The Lambda walks the Markdown at `# ` and `## ` headings and packs content into chunks up to 15,000 characters, roughly 3,000 words. Short sections are packed together rather than written out as their own tiny objects. A section larger than the limit is broken down at `### ` and deeper headings, then paragraphs and lines; oversized content that still cannot be split at those boundaries is split by character count. Continuation chunks repeat the section's first heading with `(continued)` appended. Contiguous Markdown table rows and fenced code blocks are kept together when they fit within the limit; an oversized table or code block may be split as a last resort.
 
-Every chunk opens with a blockquote preamble naming the source object, the document title, the current section, and the chunk position, which keeps a chunk self-describing for a downstream summarizer that sees it in isolation:
+Every chunk opens with a blockquote preamble naming the source object and chunk position; document title and section are included when available. This keeps each chunk self-describing for a downstream summarizer that sees it in isolation:
 
 ```markdown
 > Source: guides/amazon-guardduty-0001.md
@@ -230,14 +230,14 @@ The manifest contains the exam guide plus the following official AWS documentati
 - [Amazon EventBridge](https://docs.aws.amazon.com/pdfs/eventbridge/latest/userguide/user-guide.pdf)
 - [AWS Config](https://docs.aws.amazon.com/pdfs/config/latest/developerguide/config-dg.pdf)
 - [AWS Control Tower](https://docs.aws.amazon.com/pdfs/controltower/latest/userguide/controltower-ug.pdf)
-- [Amazon Managed Grafana](https://docs.aws.amazon.com/pdfs/grafana/latest/userguide/service-guide.pdf)
+- [Amazon Managed Grafana](https://docs.aws.amazon.com/pdfs/grafana/latest/userguide/service-guide.pdf.pdf)
 - [AWS Organizations](https://docs.aws.amazon.com/pdfs/organizations/latest/userguide/organizations-userguide.pdf)
 - [AWS Resilience Hub](https://docs.aws.amazon.com/pdfs/resilience-hub/latest/userguide/resilience-hub-guide.pdf)
 - [AWS Resource Explorer](https://docs.aws.amazon.com/pdfs/resource-explorer/latest/userguide/resource_explorer_ug.pdf)
 - [AWS Service Catalog](https://docs.aws.amazon.com/pdfs/servicecatalog/latest/adminguide/service-catalog-ag.pdf)
 - [AWS Systems Manager](https://docs.aws.amazon.com/pdfs/systems-manager/latest/userguide/systems-manager-ug.pdf)
 - [AWS Trusted Advisor](https://docs.aws.amazon.com/pdfs/awssupport/latest/user/support-ug.pdf)
-- [AWS User Notifications](https://docs.aws.amazon.com/pdfs/notifications/latest/userguide/notifications-guide.pdf)
+- [AWS User Notifications](https://docs.aws.amazon.com/pdfs/notifications/latest/userguide/notifications-guide.pdf.pdf)
 - [AWS Well-Architected Tool](https://docs.aws.amazon.com/pdfs/wellarchitected/latest/userguide/wellarchitected-ug.pdf)
 
 </details>
@@ -245,7 +245,7 @@ The manifest contains the exam guide plus the following official AWS documentati
 <details>
 <summary><strong>Networking and Content Delivery</strong></summary>
 
-- [Amazon Application Recovery Controller](https://docs.aws.amazon.com/pdfs/r53recovery/latest/dg/r53-recovery-guide.pdf)
+- [Amazon Application Recovery Controller](https://docs.aws.amazon.com/pdfs/r53recovery/latest/dg/r53-recovery-guide.pdf.pdf)
 - [Amazon VPC](https://docs.aws.amazon.com/pdfs/vpc/latest/userguide/vpc-ug.pdf)
 - [AWS Site-to-Site VPN](https://docs.aws.amazon.com/pdfs/vpn/latest/s2svpn/s2s-vpn-user-guide.pdf)
 - [AWS Verified Access](https://docs.aws.amazon.com/pdfs/verified-access/latest/ug/verified-access-ug.pdf)
