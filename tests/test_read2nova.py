@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -12,6 +13,11 @@ from unittest.mock import MagicMock, patch
 
 
 class Body(io.BytesIO):
+    """Mimics botocore StreamingBody, whose context manager yields the raw stream."""
+
+    def __enter__(self):
+        return io.BufferedReader(io.BytesIO(self.getvalue()))
+
     def iter_lines(self):
         return iter(self.getvalue().splitlines())
 
@@ -43,14 +49,16 @@ class Read2NovaTests(unittest.TestCase):
             'botocore.exceptions': exceptions
         }):
             spec.loader.exec_module(self.module)
+        self.module.logger.addHandler(logging.NullHandler())
         env = patch.dict(os.environ, {
             'READ_BUCKET': 'read-use2-lukach-io',
             'FLEX_BUCKET': 'flex-use2-lukach-io',
             'NOVA_BUCKET': 'nova-use2-lukach-io',
+            'BATCH_BUCKET': 'batch-use2-lukach-io',
             'MODEL_ID': 'us.amazon.nova-2-lite-v1:0',
             'STATE_TABLE': 'state', 'BATCH_ROLE_ARN': 'arn:aws:iam::123456789012:role/batch',
             'REQUESTS_PER_MINUTE': '2', 'TOKENS_PER_MINUTE': '100000',
-            'MAX_OUTPUT_TOKENS': '16000', 'BATCH_SIZE': '500', 'MAX_ACTIVE_JOBS': '2'
+            'MAX_OUTPUT_TOKENS': '8000', 'BATCH_SIZE': '500', 'MAX_ACTIVE_JOBS': '2'
         })
         env.start()
         self.addCleanup(env.stop)
@@ -154,7 +162,7 @@ class Read2NovaTests(unittest.TestCase):
         return self.module._get('control')['active']
 
     def output(self, job, records):
-        self.objects[('nova-use2-lukach-io', f"_batch/jobs/{job['id']}/raw/job/input.jsonl.out")] = (
+        self.objects[('batch-use2-lukach-io', f"jobs/{job['id']}/raw/job/input.jsonl.out")] = (
             b'\n'.join(json.dumps(record).encode() for record in records)
         )
         self.jobs[job['arn']] = 'Completed'
@@ -166,14 +174,49 @@ class Read2NovaTests(unittest.TestCase):
             Bucket = 'read-use2-lukach-io', Key = 'guides/my file+.md',
             IfMatch = '"' + hashlib.md5(b'## Source\n\nFacts.').hexdigest() + '"'
         )
-        prepared = json.loads(self.objects[('read-use2-lukach-io', item['prepared'])])
+        prepared = json.loads(self.objects[('batch-use2-lukach-io', item['prepared'])])
         self.assertEqual(prepared['recordId'], item['id'])
         self.assertEqual(item['record_bytes'],
                          len(json.dumps(prepared, ensure_ascii = False).encode()) + 1)
         self.assertEqual(prepared['modelInput']['system'], [{'text': self.module.SYSTEM_PROMPT}])
+        self.assertEqual(prepared['modelInput']['inferenceConfig'],
+                         {'maxTokens': 8000, 'temperature': 0})
+        self.assertEqual(item['source_bytes'], len(b'## Source\n\nFacts.'))
         self.assertNotIn('serviceTier', prepared['modelInput'])
         self.runtime.converse.assert_not_called()
         self.batch.create_model_invocation_job.assert_not_called()
+
+    def test_prompt_defines_structure_and_worked_example(self):
+        prompt = self.module.SYSTEM_PROMPT
+        sections = ['**Key concepts**', '**Configuration, defaults, and limits**',
+                    '**When to use and trade-offs**', '> **Key Takeaway:**']
+        for marker in ['Required Output Structure', 'Example source:', 'Example output:'] + sections:
+            self.assertIn(marker, prompt)
+        example = prompt.split('Example output:\n', 1)[1].split('\n\nTreat the user message', 1)[0]
+        self.module.validate_markdown(example)
+        positions = [example.index(marker) for marker in ['### '] + sections]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_low_condensation_is_logged_for_flex_and_batch(self):
+        flex = self.ingest('sample.md', bucket = 'flex-use2-lukach-io', body = b'### Source\n\n' + b'x' * 100)
+        self.runtime.converse.return_value['output']['message']['content'][0]['text'] = (
+            '### Source\n\n' + 'x' * 90
+        )
+        with self.assertLogs(self.module.logger, level = 'WARNING') as logs:
+            self.notify(flex)
+        self.assertIn(f"LowCondensation id={flex['id']} key=sample.md ratio=0.91", logs.output[0])
+        self.assertEqual(self.module._get(flex['id'])['status'], 'DONE')
+
+        items = [self.ingest(f'guides/chunk-{index}.md', body = b'### Source\n\n' + b'x' * 100)
+                 for index in range(100)]
+        self.dispatch()
+        response = copy.deepcopy(self.response)
+        response['output']['message']['content'][0]['text'] = '### Source\n\nShort.'
+        self.output(self.active()[0], [{'recordId': item['id'], 'modelOutput': response}
+                                       for item in items])
+        with self.assertNoLogs(self.module.logger, level = 'WARNING'):
+            self.dispatch()
+        self.assertEqual(self.module._get(items[0]['id'])['status'], 'DONE')
 
     def test_duplicate_notification_does_not_reset_progress(self):
         item = self.ingest()
@@ -197,11 +240,25 @@ class Read2NovaTests(unittest.TestCase):
         self.assertEqual(request['roleArn'], os.environ['BATCH_ROLE_ARN'])
         job = self.active()[0]
         self.assertEqual(request['clientRequestToken'], job['id'])
-        payload = self.objects[('read-use2-lukach-io', f"_batch/jobs/{job['id']}/input.jsonl")]
+        payload = self.objects[('batch-use2-lukach-io', f"jobs/{job['id']}/input.jsonl")]
         self.assertEqual(len(payload.splitlines()), 100)
         self.assertEqual({json.loads(line)['recordId'] for line in payload.splitlines()},
                          {item['id'] for item in items})
         self.assertTrue(all(self.module._get(item['id'])['status'] == 'BATCH' for item in items))
+        self.assertEqual(request['outputDataConfig']['s3OutputDataConfig']['s3Uri'],
+                         f"s3://batch-use2-lukach-io/jobs/{job['id']}/raw/")
+
+    def test_nova_bucket_contains_only_edited_markdown(self):
+        items = self.fill(100)
+        self.dispatch()
+        job = self.active()[0]
+        self.output(job, [{'recordId': item['id'], 'modelOutput': self.response} for item in items])
+        self.dispatch()
+        self.assertFalse(self.active())
+        for bucket in ('nova-use2-lukach-io', 'read-use2-lukach-io'):
+            self.assertEqual(sorted(key for name, key in self.objects if name == bucket),
+                             sorted(item['key'] for item in items))
+        self.assertIn(('batch-use2-lukach-io', f"jobs/{job['id']}/manifest.json"), self.objects)
 
     def test_batch_size_and_active_job_limit(self):
         self.fill(1100)
@@ -291,7 +348,7 @@ class Read2NovaTests(unittest.TestCase):
         self.s3.get_object.reset_mock()
         self.dispatch()
         prepared_keys = [call.kwargs['Key'] for call in self.s3.get_object.call_args_list
-                         if call.kwargs['Key'].startswith('_batch/prepared/')]
+                         if call.kwargs['Key'].startswith('prepared/')]
         first = self.module._get(self.active()[0]['ids'][0])['prepared']
         self.assertNotIn(first, prepared_keys)
 
@@ -337,6 +394,30 @@ class Read2NovaTests(unittest.TestCase):
             self.dispatch()
         self.assertFalse(self.active())
         self.assertTrue(all(self.module._get(item['id'])['status'] == 'FAILED' for item in items))
+
+    def test_deleted_output_for_processed_job_reports_clear_reason(self):
+        items = self.fill(100)
+        self.dispatch()
+        self.jobs[self.active()[0]['arn']] = 'Completed'
+        get_job = self.batch.get_model_invocation_job.side_effect
+        self.batch.get_model_invocation_job.side_effect = lambda **kw: {
+            **get_job(**kw), 'processedRecordCount': 100
+        }
+        with self.assertLogs(self.module.logger, level = 'ERROR'):
+            self.dispatch()
+        self.assertIn('batch output may have been deleted',
+                      self.module._get(items[0]['id'])['error'])
+
+    def test_blank_output_lines_are_ignored(self):
+        items = self.fill(100)
+        self.dispatch()
+        job = self.active()[0]
+        self.output(job, [{'recordId': item['id'], 'modelOutput': self.response} for item in items])
+        key = ('batch-use2-lukach-io', f"jobs/{job['id']}/raw/job/input.jsonl.out")
+        self.objects[key] += b'\n\n'
+        self.dispatch()
+        self.assertFalse(self.active())
+        self.assertEqual(self.module._get(items[0]['id'])['status'], 'DONE')
 
     def test_s3_write_failure_keeps_job_for_collection_retry(self):
         items = self.fill(100)
@@ -594,9 +675,12 @@ class Read2NovaTests(unittest.TestCase):
         self.assertEqual(self.metadata[('nova-use2-lukach-io', 'sample.md')],
                          {'source-id': second['id']})
 
-    def test_artifact_notifications_do_not_recurse(self):
-        self.assertEqual(self.ingest('_batch/generated.md'), {})
-        self.assertFalse(self.items)
+    def test_source_buckets_contain_only_sources(self):
+        item = self.ingest('_batch/generated.md')
+        self.assertEqual(item['status'], 'PENDING')
+        self.assertEqual(sorted(self.objects),
+                         [('batch-use2-lukach-io', item['prepared']),
+                          ('read-use2-lukach-io', '_batch/generated.md')])
 
     def test_quota_reservations_survive_invocations(self):
         self.items['nova'] = {

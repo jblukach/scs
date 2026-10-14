@@ -121,6 +121,15 @@ class ScsStack(Stack):
             removal_policy = RemovalPolicy.RETAIN
         )
 
+        batch_bucket = _s3.Bucket(
+            self, 'batch_bucket',
+            bucket_name = 'batch-use2-lukach-io',
+            encryption = _s3.BucketEncryption.S3_MANAGED,
+            block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl = True,
+            removal_policy = RemovalPolicy.RETAIN
+        )
+
     ### LAMBDA LAYER ###
 
         requests = _lambda.LayerVersion(
@@ -288,7 +297,7 @@ class ScsStack(Stack):
         )
         max_output_tokens = CfnParameter(
             self, 'NovaMaxOutputTokens',
-            type = 'Number', default = 16000, min_value = 1, max_value = 64000,
+            type = 'Number', default = 8000, min_value = 1, max_value = 64000,
             description = 'Maximum output tokens reserved for each edit'
         )
         batch_size = CfnParameter(
@@ -385,9 +394,8 @@ class ScsStack(Stack):
                 }
             )
         )
-        read_bucket.grant_read(batch_role, '_batch/jobs/*')
-        nova_bucket.grant_read(batch_role, '_batch/jobs/*')
-        nova_bucket.grant_put(batch_role, '_batch/jobs/*')
+        batch_bucket.grant_read(batch_role, 'jobs/*')
+        batch_bucket.grant_put(batch_role, 'jobs/*')
         batch_role.add_to_policy(_iam.PolicyStatement(
             actions = ['bedrock:InvokeModel'], resources = model_resources
         ))
@@ -403,6 +411,7 @@ class ScsStack(Stack):
             handler = 'read2nova.handler',
             environment = dict(
                 READ_BUCKET = read_bucket.bucket_name,
+                BATCH_BUCKET = batch_bucket.bucket_name,
                 FLEX_BUCKET = flex_bucket.bucket_name,
                 NOVA_BUCKET = nova_bucket.bucket_name,
                 MODEL_ID = 'us.amazon.nova-2-lite-v1:0',
@@ -420,7 +429,8 @@ class ScsStack(Stack):
         )
         read_bucket.grant_read(read2nova)
         flex_bucket.grant_read(read2nova)
-        read_bucket.grant_put(read2nova, '_batch/*')
+        batch_bucket.grant_read(read2nova)
+        batch_bucket.grant_put(read2nova)
         nova_bucket.grant_read(read2nova)
         nova_bucket.grant_put(read2nova)
         quota_table.grant_read_write_data(read2nova)
@@ -528,4 +538,11 @@ class ScsStack(Stack):
             ),
             threshold = 1, evaluation_periods = 1,
             treat_missing_data = _cloudwatch.TreatMissingData.NOT_BREACHING
+        )
+        _logs.MetricFilter(
+            self, 'nova_low_condensation',
+            log_group = nova_logs,
+            filter_pattern = _logs.FilterPattern.literal('"LowCondensation"'),
+            metric_namespace = 'Read2Nova', metric_name = 'LowCondensation',
+            metric_value = '1'
         )

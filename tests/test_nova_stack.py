@@ -24,7 +24,8 @@ class NovaStackTests(unittest.TestCase):
         cls.directory.cleanup()
 
     def test_unversioned_private_buckets_are_retained(self):
-        for name in ('read-use2-lukach-io', 'nova-use2-lukach-io', 'flex-use2-lukach-io'):
+        for name in ('read-use2-lukach-io', 'nova-use2-lukach-io', 'flex-use2-lukach-io',
+                     'batch-use2-lukach-io'):
             self.template.has_resource('AWS::S3::Bucket', {
                 'DeletionPolicy': 'Retain',
                 'Properties': Match.object_like({
@@ -94,6 +95,13 @@ class NovaStackTests(unittest.TestCase):
         self.assertEqual(template['Parameters']['NovaBatchSize']['Default'], 500)
         self.assertEqual(template['Parameters']['NovaBatchSize']['MinValue'], 100)
         self.assertEqual(template['Parameters']['NovaActiveJobs']['Default'], 2)
+        self.assertEqual(template['Parameters']['NovaMaxOutputTokens']['Default'], 8000)
+        for name in ('ChunkFailures', 'LowCondensation'):
+            self.template.has_resource_properties('AWS::Logs::MetricFilter', {
+                'MetricTransformations': [Match.object_like({
+                    'MetricNamespace': 'Read2Nova', 'MetricName': name
+                })]
+            })
         self.template.has_resource_properties('AWS::DynamoDB::Table', {
             'BillingMode': 'PAY_PER_REQUEST',
             'TableName': 'read2nova-state',
@@ -210,6 +218,16 @@ class NovaStackTests(unittest.TestCase):
         pass_role = next(statement for statement in statements if statement['Action'] == 'iam:PassRole')
         self.assertEqual(pass_role['Condition'],
                          {'StringEquals': {'iam:PassedToService': 'bedrock.amazonaws.com'}})
+        roles = self.template.find_resources('AWS::IAM::Role')
+        batch_role = next(name for name, role in roles.items()
+                          if 'Condition' in role['Properties']['AssumeRolePolicyDocument']['Statement'][0])
+        buckets = {bucket['Properties'].get('BucketName'): name
+                   for name, bucket in self.template.find_resources('AWS::S3::Bucket').items()}
+        role_policies = json.dumps([policy for policy in policies.values()
+                                    if {'Ref': batch_role} in policy['Properties']['Roles']])
+        self.assertIn(buckets['batch-use2-lukach-io'], role_policies)
+        for name in ('read-use2-lukach-io', 'flex-use2-lukach-io', 'nova-use2-lukach-io'):
+            self.assertNotIn(buckets[name], role_policies)
 
 
 if __name__ == '__main__':
