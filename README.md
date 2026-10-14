@@ -2,7 +2,7 @@
 
 An AWS CDK project that collects the official AWS documentation PDFs relevant to the **AWS Certified Security - Specialty (SCS-C03)** exam.
 
-The stack creates private S3 buckets and four Lambda functions. The `scs-download` function is invoked manually to download the PDFs in `download/download.py` into the study bucket. Uploading a PDF to the PDF bucket triggers conversion to Markdown, and uploading one to the raw bucket triggers splitting into parts of up to 1,000 pages. The `text2chunk` function is invoked separately to chunk Markdown from the Markdown bucket; the deployed stack does not trigger it automatically when Markdown is created.
+The stack creates private S3 buckets and five Lambda functions. The `scs-download` function is invoked manually to download the PDFs in `download/download.py` into the study bucket. Uploading a PDF to the PDF bucket triggers conversion to Markdown, and uploading one to the raw bucket triggers splitting into parts of up to 1,000 pages. The `text2chunk` function is invoked separately to chunk Markdown from the Markdown bucket; the deployed stack does not trigger it automatically when Markdown is created.
 
 ## Overview
 
@@ -12,8 +12,9 @@ This repository turns the official AWS documentation set for the AWS Certified S
 2. Upload source PDFs to the PDF bucket to trigger Markdown conversion.
 3. Upload large source PDFs to the raw bucket to trigger splitting into numbered parts. This is an independent path; the split bucket does not trigger another Lambda.
 4. Manually invoke the chunker to process Markdown in the Markdown bucket into section-aware, size-limited fragments for summarization and retrieval.
+5. Copy selected chunks to the read bucket for Amazon Nova 2 Lite batch inference, or to the FLEX bucket for automatic small-set testing. Both paths save successful edits in the Nova bucket.
 
-The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with source handlers kept under `download/`, `pdf2md/`, `raw2split/`, and `text2chunk/`.
+The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with source handlers kept under `download/`, `pdf2md/`, `raw2split/`, `text2chunk/`, and `read2nova/`.
 
 ## What it deploys
 
@@ -29,9 +30,21 @@ The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with 
 | Container Lambda | `raw2split`, Python 3.13 image with `pymupdf`, x86_64, 15-minute timeout, 4 GiB memory |
 | Chunk bucket | `chunk-use2-lukach-io`, private S3 bucket for the Markdown chunks |
 | Lambda function | `text2chunk`, Python 3.13, ARM64, 15-minute timeout, 3,008 MiB memory |
-| CloudWatch Logs | `/aws/lambda/scs-download`, `/aws/lambda/pdf2md`, `/aws/lambda/raw2split`, and `/aws/lambda/text2chunk`, one-month retention |
+| Read bucket | `read-use2-lukach-io`, private, encrypted, no versioning, retained on stack deletion |
+| FLEX bucket | `flex-use2-lukach-io`, private, encrypted, no versioning, automatically processes small test sets with FLEX |
+| Nova bucket | `nova-use2-lukach-io`, private, encrypted, no versioning, retained on stack deletion |
+| SQS queue | `read2nova`, encrypted, 90-minute visibility timeout, 14-day retention |
+| SQS DLQ | `read2nova-dlq`, encrypted, receives messages after five unsuccessful receives, 14-day retention |
+| FLEX queue/DLQ | `flex2nova` and `flex2nova-dlq`, encrypted, one message per invocation, five receives before DLQ, 14-day retention, 90-minute visibility |
+| Workflow failure queue | `read2nova-workflow-dlq`, retains failed asynchronous Lambda invocations and EventBridge deliveries for 14 days |
+| Lambda function | `read2nova`, Python 3.13, ARM64, bundled AWS SDK, 15-minute timeout, 1 GiB memory, reserved concurrency 1 |
+| DynamoDB table | `read2nova-state`, durable upload-event progress, active batch ownership, status index, and automatic FLEX quota reservations; on-demand billing |
+| Bedrock service role | Scoped S3 input/output artifact access and Nova US inference-profile permissions |
+| EventBridge | Five-minute dispatch/reconciliation schedule and batch terminal-state notifications |
+| CloudWatch alarms | Batch/FLEX DLQs and queue age, workflow failure queue, and failed chunks |
+| CloudWatch Logs | One-month retention for all five functions, including `/aws/lambda/read2nova` |
 
-All six buckets and their contents are configured for removal when the stack is destroyed. Downloaded objects are replaced when the downloader runs again.
+The original six buckets and their contents are configured for removal when the stack is destroyed. The read/FLEX/Nova buckets, all five Nova queues, and state table are retained so source objects, results, and pending work are not destroyed. No stack-managed bucket has versioning enabled. Overwriting an object replaces it without retaining an older version. Downloaded objects are replaced when the downloader runs again.
 
 ## Prerequisites
 
@@ -40,6 +53,9 @@ All six buckets and their contents are configured for removal when the stack is 
 - Node.js, required by the AWS CDK CLI
 - Docker, running locally for the CDK container-image build
 - An existing `packages-use2-lukach-io` bucket in the deployment account and `us-east-2` region, containing `requests.zip`
+- Amazon Bedrock access to `us.amazon.nova-2-lite-v1:0`, including the destination regions in its US cross-region inference profile
+- Nova batch-job capacity available in the account (defaults allocate two active jobs to this pipeline)
+- On-demand Nova capacity for automatic processing of files copied to the FLEX bucket
 
 The Lambda layer expects `requests.zip` to contain the `requests` dependency and to be compatible with Python 3.13 on ARM64.
 
@@ -51,7 +67,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cdk bootstrap aws://ACCOUNT/us-east-2 --qualifier lukach
-cdk deploy
+cdk deploy --profile scs
 ```
 
 Replace `ACCOUNT` with the AWS account ID used for deployment. The stack is pinned to `us-east-2` and uses the CDK asset qualifier `lukach`, so the bootstrap environment must use that same qualifier. Deployment does not download or convert documents: the downloader and chunker are manually invoked, while PDF conversion and splitting start only after an object is uploaded to their respective input buckets.
@@ -136,6 +152,115 @@ Chunks are written to the root of the chunk bucket with no folders. Each chunk k
 
 Each file is downloaded to a private directory under `/tmp` that is removed after its chunks are uploaded, so the function's scratch space stays empty between files.
 
+## Edit chunks with Nova 2 Lite batch inference
+
+After deployment, copy the existing small chunks into the read bucket:
+
+```bash
+aws s3 cp ./selected-chunks/ s3://read-use2-lukach-io/guides/ \
+  --recursive --exclude "*" --include "*.md" --region us-east-2 --profile scs
+
+aws s3 ls s3://nova-use2-lukach-io/guides/ --recursive \
+  --region us-east-2 --profile scs
+```
+
+You can also copy directly from `chunk-use2-lukach-io`, using the same recursive include/exclude filters. Copying is intentional: the chunk bucket does not automatically incur inference charges. Only object-created events for lowercase `.md` keys enqueue registration, including S3 copies and completed multipart uploads. Objects that existed before notification setup must be copied again to create an event.
+
+`read2nova` reads the source with an `If-Match` condition against the upload event's ETag, prepares a Converse JSON record under `_batch/prepared/`, and registers a hash of the bucket, key, event sequencer, and ETag in DynamoDB. SQS is acknowledged only after this durable registration; pending batch work then survives beyond SQS's 14-day retention. Duplicate deliveries of the same event do not reset progress or cause another inference. Reuploading even identical content creates a new event sequencer and is processed again.
+
+There is no S3 versioning. If different content replaces a source before registration, its old notification fails the ETag condition and follows SQS/DLQ recovery rather than editing the wrong text. Once prepared, retries use the saved JSON input even if the source subsequently changes. ETags are content validators, not historical upload identifiers: identical replacement content can still satisfy an older event's ETag.
+
+A five-minute dispatcher assembles 100-500 records, capped at 64 MiB per input file, into `_batch/jobs/JOB_ID/input.jsonl` and submits an asynchronous Bedrock batch job. Defaults are **500 records/job and two active jobs**. Batch capacity is separate from synchronous RPM/TPM budgets; change `NovaBatchSize` or `NovaActiveJobs` at deployment if appropriate. The worker's reserved concurrency stays at one to serialize durable ownership, but Bedrock runs the two submitted jobs independently.
+
+**The read bucket is batch-only, regardless of folder name.** There is no `tests/` exception or manual FLEX invocation for read sources. AWS requires at least 100 records per Nova batch job, so a final tail smaller than 100 stays pending until enough new chunks arrive. Nothing in the read bucket automatically falls back to FLEX, and no dummy prompts or paid padding are submitted.
+
+Bedrock writes raw output under `nova-use2-lukach-io/_batch/jobs/JOB_ID/raw/`. Terminal-job EventBridge notifications trigger collection, with scheduled reconciliation as a fallback for missed events. Results are matched by `recordId`, not output order, validated, and saved as individual Markdown files under the **same key and folder path as the source**. A per-job manifest is saved under `_batch/jobs/JOB_ID/manifest.json`.
+
+The Lambda does not wait for batch inference. Interrupted preparation uses the same persisted job token when resubmitted, and interrupted collection resumes from durable chunk statuses. Submitted jobs have a 48-hour timeout; actual completion depends on Bedrock capacity. Batch inference is **not FLEX**, and its pricing is separate.
+
+The editor prompt preserves factual meaning, terminology, formulas, references and provenance, requires academic prose, and requests raw GFM with headings starting at H3 and consistent callouts. An unambiguous whole-response `markdown`, `md`, or unlabeled fence is removed before validation, preserving the enclosed content and legitimate inner code blocks. Incomplete, mismatched, or ambiguous wrappers remain errors. Empty responses, incomplete stop reasons, H1/H2 headings, and unclosed code fences are rejected. This normalization applies to both batch and FLEX and avoids retrying solely for a removable wrapper. Validation cannot guarantee factual accuracy; review representative edits before running the full collection.
+
+### Automatically test a small set with FLEX
+
+Copy one or more Markdown files into `flex-use2-lukach-io`. Copying is the only action needed to start processing:
+
+```bash
+aws s3 cp ./test-chunks/ s3://flex-use2-lukach-io/tests/ \
+  --recursive --exclude "*" --include "*.md" --region us-east-2 --profile scs
+
+aws s3 ls s3://nova-use2-lukach-io/tests/ --recursive \
+  --region us-east-2 --profile scs
+
+aws s3 cp s3://nova-use2-lukach-io/tests/sample.md ./sample-edited.md \
+  --region us-east-2 --profile scs
+```
+
+The `tests/` folder is just an example; every lowercase `.md` key in the FLEX bucket uses FLEX, regardless of prefix, except reserved `_batch/` artifacts. S3 events enter the separate `flex2nova` queue. The worker conditionally reads the source using the event's ETag, calls Converse with `serviceTier={"type":"flex"}`, validates the edit, and writes it under the **same key in the Nova bucket**. Processing is asynchronous from the upload, so the output may take several minutes to appear. No CLI Lambda invocation or minimum file count is required.
+
+FLEX uses the same prompt and output validation as batch, but it is a separate billable mode and does not certify batch-job IAM or runtime behavior. Run a representative batch of at least 100 files before the full collection. Use different source keys for test and production outputs: uploading the same key in both buckets writes to the same Nova key, and whichever finishes last replaces the output. Previous outputs are not retained.
+
+Like `text2chunk`, this is a ZIP-based Python 3.13 ARM64 Lambda using the runtime's bundled `boto3`, with no Docker or SDK layer. That SDK must support `CreateModelInvocationJob.modelInvocationType="Converse"` and FLEX's `serviceTier` field. Unsupported fields fail visibly; there is no silent Standard-tier fallback.
+
+### Limits, failures, and recovery
+
+[Nova 2 Lite](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-2-lite.html) has a **1M-token context window and approximately 64K maximum output**, not 1M output tokens. `NovaMaxOutputTokens` defaults to 16000 and supports up to 64000. This pipeline accepts at most 100,000 UTF-8 bytes per source chunk, keeping prepared batches well below the 1 GB input-file limit even with JSON escaping. The existing 15,000-character chunks fit comfortably. Larger sources fail registration for rechunking.
+
+Automatic FLEX calls reserve UTF-8 byte counts plus prompt/framing overhead and the maximum output tokens against a persistent rolling-minute ledger. Defaults are `NovaRequestsPerMinute=10` and `NovaTokensPerMinute=100000`; these parameters **do not limit batch jobs**. They must fit the account's available on-demand quota, shared with other callers. FLEX uses a 780-second read timeout without SDK inference retries. Waiting is billable Lambda time, and SQS retries after timeouts may cause duplicate inference charges.
+
+**Do not increase Lambda reserved concurrency or run another worker against this table.** The single coordinator makes batch ownership and test quota reservations safe. Increase `NovaActiveJobs` instead, within the account's remaining batch-job quota.
+
+Read-source preparation failures retry through SQS and reach `read2nova-dlq` after five unsuccessful receives. FLEX preparation, inference, validation, or persistence failures retry through `flex2nova` and reach `flex2nova-dlq` after five unsuccessful receives. Successful FLEX upload events are tracked as DONE so duplicate notifications do not invoke Nova again. Resolve failures before the 14-day queue retention expires. Redrive them to their original queue:
+
+```bash
+DLQ_ARN=$(aws sqs get-queue-attributes \
+  --queue-url "$(aws sqs get-queue-url --queue-name read2nova-dlq \
+    --region us-east-2 --profile scs --query QueueUrl --output text)" \
+  --attribute-names QueueArn --region us-east-2 --profile scs \
+  --query Attributes.QueueArn --output text)
+
+aws sqs start-message-move-task --source-arn "$DLQ_ARN" \
+  --max-number-of-messages-per-second 1 --region us-east-2 --profile scs
+```
+
+For FLEX redrive, use the same commands with `flex2nova-dlq` instead of `read2nova-dlq`; the message-move task returns the original source notifications to `flex2nova`. Event sequencers and ETags are preserved, and a failed FLEX chunk never becomes a batch chunk. Redrive cannot recover overwritten content that was never prepared; upload the intended file again to create a new event instead.
+
+The separate `read2nova-workflow-dlq` contains failed asynchronous Lambda invocations and failed EventBridge deliveries, **not S3 source notifications**. Inspect the error, fix the cause, and invoke `{"action":"dispatch"}` to reconcile again. Do not redrive those envelopes into either source queue.
+
+Model record errors, invalid Markdown, and missing terminal-job results are logged as `ChunkFailed` and retained as **FAILED** chunks in DynamoDB. They do not automatically incur unlimited paid retries. Find failed IDs and details:
+
+```bash
+aws dynamodb query --table-name read2nova-state --index-name by-status \
+  --key-condition-expression "#s = :s" \
+  --expression-attribute-names '{"#s":"status"}' \
+  --expression-attribute-values '{":s":{"S":"FAILED"}}' \
+  --region us-east-2 --profile scs
+
+aws dynamodb get-item --table-name read2nova-state \
+  --key '{"id":{"S":"FAILED_SOURCE_HASH"}}' --consistent-read \
+  --region us-east-2 --profile scs
+
+aws lambda invoke --function-name read2nova \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"action":"retry","ids":["FAILED_SOURCE_HASH"]}' \
+  --region us-east-2 --profile scs response.json
+```
+
+Retry accepts up to 500 failed **read-bucket** IDs whose jobs have finished collection, returning them to batch pending. FLEX IDs are rejected by this action; use FLEX-DLQ redrive instead. Retry original IDs rather than copying every successful source again. Failed preparation needs source-DLQ recovery instead; no chunk exists yet.
+
+CloudWatch alarms cover both source DLQs, the workflow failure queue, batch/FLEX messages older than one day, and model/validation failures. They are visible in CloudWatch but have no email/SNS actions configured. Monitor these before large runs; the durable manifest protects registered batch work, not notifications that expire before registration or unfinished FLEX messages. All five queues retain messages for only 14 days. FLEX and batch coordination share one Lambda execution slot, so long FLEX waits delay batch registration/dispatch; keep the FLEX bucket for small test sets.
+
+To pause new batch submissions without discarding pending work:
+
+```bash
+aws lambda invoke --function-name read2nova \
+  --cli-binary-format raw-in-base64-out --payload '{"action":"pause"}' \
+  --region us-east-2 --profile scs response.json
+```
+
+Use `{"action":"resume"}` to resume. Already submitted jobs continue and their results are collected while paused; automatic FLEX uploads continue independently of this batch pause. Pausing is not a spending cap or cancellation of running jobs.
+
+Use immutable source keys and avoid overwriting a key while work is pending. Events and jobs can finish out of order, so an older prepared upload can otherwise overwrite a newer result. Neither source nor output history is retained by S3. `_batch/` is reserved for internal artifacts in the read/FLEX/Nova buckets; never upload source chunks there. Prepared inputs, raw artifacts, and state are retained without automatic lifecycle deletion, so include their storage in cost planning.
+
 ## Project layout
 
 ```text
@@ -148,10 +273,13 @@ Each file is downloaded to a private directory under `/tmp` that is removed afte
 ├── raw2split/Dockerfile   # Container Lambda image with pymupdf
 ├── raw2split/raw2split.py # S3 event handler and PDF splitting
 ├── text2chunk/text2chunk.py # Markdown chunking handler
+├── read2nova/read2nova.py # Registration, batch jobs/results, and automatic FLEX uploads
 ├── scs/scs_stack.py       # Infrastructure definition
 ├── tests/test_pdf2md.py  # Conversion event test
 ├── tests/test_raw2split.py # Split event test
 ├── tests/test_text2chunk.py # Chunking test
+├── tests/test_read2nova.py # Batch recovery and automatic FLEX routing tests
+├── tests/test_nova_stack.py # Nova infrastructure assertions
 └── requirements.txt       # Python dependencies
 ```
 
@@ -300,7 +428,7 @@ The manifest contains the exam guide plus the following official AWS documentati
 ```bash
 cdk diff       # Review infrastructure changes
 cdk synth      # Generate the CloudFormation template
-cdk destroy    # Delete the stack and its bucket contents
+cdk destroy    # Delete the stack; Nova pipeline data/queues/table are retained
 ```
 
 The stack is intentionally focused on collecting documents. Edit the `pdfs` mapping of filename to URL in `download/download.py` to change the manifest.
