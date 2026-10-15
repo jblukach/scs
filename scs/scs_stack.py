@@ -283,6 +283,41 @@ class ScsStack(Stack):
             removal_policy = RemovalPolicy.DESTROY
         )
 
+        chunk2read = _lambda.Function(
+            self, 'chunk2read',
+            function_name = 'chunk2read',
+            runtime = _lambda.Runtime.PYTHON_3_13,
+            architecture = _lambda.Architecture.ARM_64,
+            code = _lambda.Code.from_asset(
+                'chunk2read', exclude = ['__pycache__', '*.pyc']
+            ),
+            handler = 'chunk2read.handler',
+            environment = dict(
+                CHUNK_BUCKET = chunk_bucket.bucket_name,
+                NOVA_BUCKET = nova_bucket.bucket_name,
+                READ_BUCKET = read_bucket.bucket_name,
+                FLEX_BUCKET = flex_bucket.bucket_name
+            ),
+            timeout = Duration.seconds(900),
+            memory_size = 1024,
+            reserved_concurrent_executions = 1
+        )
+
+        chunk_bucket.grant_read(chunk2read)
+        chunk2read.add_to_role_policy(_iam.PolicyStatement(
+            actions = ['s3:ListBucket'],
+            resources = [nova_bucket.bucket_arn]
+        ))
+        read_bucket.grant_put(chunk2read)
+        flex_bucket.grant_put(chunk2read)
+
+        _logs.LogGroup(
+            self, 'chunk2read_logs',
+            log_group_name = '/aws/lambda/'+chunk2read.function_name,
+            retention = _logs.RetentionDays.ONE_MONTH,
+            removal_policy = RemovalPolicy.DESTROY
+        )
+
     ### NOVA BATCH PIPELINE ###
 
         requests_per_minute = CfnParameter(

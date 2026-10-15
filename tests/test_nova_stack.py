@@ -90,6 +90,50 @@ class NovaStackTests(unittest.TestCase):
             }
         })
 
+    def test_chunk2read_is_zip_based_and_manual_only(self):
+        functions = self.template.find_resources('AWS::Lambda::Function')
+        identifier, resource = next(
+            (name, resource) for name, resource in functions.items()
+            if resource['Properties'].get('FunctionName') == 'chunk2read'
+        )
+        worker = resource['Properties']
+        self.assertEqual(worker['Runtime'], 'python3.13')
+        self.assertEqual(worker['Architectures'], ['arm64'])
+        self.assertEqual(worker['Handler'], 'chunk2read.handler')
+        self.assertEqual(worker['Timeout'], 900)
+        self.assertEqual(worker['ReservedConcurrentExecutions'], 1)
+        self.assertNotEqual(worker.get('PackageType'), 'Image')
+        self.assertIn('S3Key', worker['Code'])
+        self.assertEqual(set(worker['Environment']['Variables']), {
+            'CHUNK_BUCKET', 'NOVA_BUCKET', 'READ_BUCKET', 'FLEX_BUCKET'
+        })
+        for kind in ('AWS::Lambda::EventSourceMapping', 'AWS::Events::Rule',
+                     'AWS::Lambda::Permission', 'Custom::S3BucketNotifications'):
+            self.assertNotIn(identifier, json.dumps(self.template.find_resources(kind)))
+        policies = self.template.find_resources('AWS::IAM::Policy')
+        policy = next(policy for policy in policies.values()
+                      if {'Ref': worker['Role']['Fn::GetAtt'][0]} in policy['Properties']['Roles'])
+        statements = policy['Properties']['PolicyDocument']['Statement']
+        buckets = {
+            bucket['Properties']['BucketName']: name
+            for name, bucket in self.template.find_resources('AWS::S3::Bucket').items()
+        }
+        for name, action in (
+            ('chunk-use2-lukach-io', 's3:GetObject*'),
+            ('nova-use2-lukach-io', 's3:ListBucket'),
+            ('read-use2-lukach-io', 's3:PutObject'),
+            ('flex-use2-lukach-io', 's3:PutObject')
+        ):
+            self.assertTrue(any(
+                action in statement['Action']
+                and buckets[name] in json.dumps(statement['Resource'])
+                for statement in statements
+            ))
+        self.template.has_resource_properties('AWS::Logs::LogGroup', {
+            'LogGroupName': {'Fn::Join': ['', ['/aws/lambda/', {'Ref': identifier}]]},
+            'RetentionInDays': 30
+        })
+
     def test_batch_and_flex_defaults(self):
         template = self.template.to_json()
         self.assertEqual(template['Parameters']['NovaBatchSize']['Default'], 500)
