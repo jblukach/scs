@@ -25,7 +25,7 @@ class NovaStackTests(unittest.TestCase):
 
     def test_unversioned_private_buckets_are_retained(self):
         for name in ('read-use2-lukach-io', 'nova-use2-lukach-io', 'flex-use2-lukach-io',
-                     'batch-use2-lukach-io'):
+                     'batch-use2-lukach-io', 'out-use2-lukach-io'):
             self.template.has_resource('AWS::S3::Bucket', {
                 'DeletionPolicy': 'Retain',
                 'Properties': Match.object_like({
@@ -129,6 +129,54 @@ class NovaStackTests(unittest.TestCase):
                 and buckets[name] in json.dumps(statement['Resource'])
                 for statement in statements
             ))
+        self.template.has_resource_properties('AWS::Logs::LogGroup', {
+            'LogGroupName': {'Fn::Join': ['', ['/aws/lambda/', {'Ref': identifier}]]},
+            'RetentionInDays': 30
+        })
+
+    def test_output_is_zip_based_manual_and_scoped_to_assembly(self):
+        functions = self.template.find_resources('AWS::Lambda::Function')
+        identifier, resource = next(
+            (name, resource) for name, resource in functions.items()
+            if resource['Properties'].get('FunctionName') == 'output'
+        )
+        worker = resource['Properties']
+        self.assertEqual(worker['Runtime'], 'python3.13')
+        self.assertEqual(worker['Architectures'], ['arm64'])
+        self.assertEqual(worker['Handler'], 'output.handler')
+        self.assertEqual(worker['Timeout'], 900)
+        self.assertEqual(worker['MemorySize'], 1024)
+        self.assertEqual(worker['ReservedConcurrentExecutions'], 1)
+        self.assertNotEqual(worker.get('PackageType'), 'Image')
+        self.assertIn('S3Key', worker['Code'])
+        self.assertEqual(set(worker['Environment']['Variables']), {
+            'CHUNK_BUCKET', 'NOVA_BUCKET', 'OUT_BUCKET'
+        })
+        for kind in ('AWS::Lambda::EventSourceMapping', 'AWS::Events::Rule',
+                     'AWS::Lambda::Permission', 'Custom::S3BucketNotifications'):
+            self.assertNotIn(identifier, json.dumps(self.template.find_resources(kind)))
+        policies = self.template.find_resources('AWS::IAM::Policy')
+        policy = next(policy for policy in policies.values()
+                      if {'Ref': worker['Role']['Fn::GetAtt'][0]} in policy['Properties']['Roles'])
+        statements = policy['Properties']['PolicyDocument']['Statement']
+        buckets = {
+            bucket['Properties']['BucketName']: name
+            for name, bucket in self.template.find_resources('AWS::S3::Bucket').items()
+        }
+        for name, action in (
+            ('chunk-use2-lukach-io', 's3:ListBucket'),
+            ('nova-use2-lukach-io', 's3:GetObject*'),
+            ('out-use2-lukach-io', 's3:PutObject')
+        ):
+            self.assertTrue(any(
+                action in statement['Action']
+                and buckets[name] in json.dumps(statement['Resource'])
+                for statement in statements
+            ))
+        writes = [statement for statement in statements
+                  if 's3:PutObject' in statement['Action']]
+        self.assertEqual(len(writes), 1)
+        self.assertIn(buckets['out-use2-lukach-io'], json.dumps(writes[0]['Resource']))
         self.template.has_resource_properties('AWS::Logs::LogGroup', {
             'LogGroupName': {'Fn::Join': ['', ['/aws/lambda/', {'Ref': identifier}]]},
             'RetentionInDays': 30

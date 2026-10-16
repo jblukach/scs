@@ -2,7 +2,7 @@
 
 An AWS CDK project that collects the official AWS documentation PDFs relevant to the **AWS Certified Security - Specialty (SCS-C03)** exam.
 
-The stack creates private S3 buckets and six Lambda functions. The `scs-download` function is invoked manually to download the PDFs in `download/download.py` into the study bucket. Uploading a PDF to the PDF bucket triggers conversion to Markdown, and uploading one to the raw bucket triggers splitting into parts of up to 1,000 pages. The `text2chunk` function is invoked separately to chunk Markdown from the Markdown bucket; the deployed stack does not trigger it automatically when Markdown is created. The manually invoked `chunk2read` function stages chunks without existing Nova results for inference.
+The stack creates private S3 buckets and seven Lambda functions. The `scs-download` function is invoked manually to download the PDFs in `download/download.py` into the study bucket. Uploading a PDF to the PDF bucket triggers conversion to Markdown, and uploading one to the raw bucket triggers splitting into parts of up to 1,000 pages. The `text2chunk` function is invoked separately to chunk Markdown from the Markdown bucket; the deployed stack does not trigger it automatically when Markdown is created. The manually invoked `chunk2read` function stages chunks without existing Nova results for inference. The manually invoked, non-Docker `output` function reassembles the edited Nova chunks into original-document Markdown files in the out bucket.
 
 ## Overview
 
@@ -13,8 +13,9 @@ This repository turns the official AWS documentation set for the AWS Certified S
 3. Upload large source PDFs to the raw bucket to trigger splitting into numbered parts. This is an independent path; the split bucket does not trigger another Lambda.
 4. Manually invoke the chunker to process Markdown in the Markdown bucket into section-aware, size-limited fragments for summarization and retrieval.
 5. Manually invoke `chunk2read` to copy chunks absent from the Nova bucket to the read bucket in complete groups of 100, with the remaining 0-99 files copied to FLEX. Both paths save successful edits in the Nova bucket.
+6. After inference finishes for all chunks, manually invoke `output` to assemble each original document in PDF-part/chunk order and publish its `.md` file to the out bucket.
 
-The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with source handlers kept under `download/`, `pdf2md/`, `raw2split/`, `text2chunk/`, `chunk2read/`, and `read2nova/`.
+The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with source handlers kept under `download/`, `pdf2md/`, `raw2split/`, `text2chunk/`, `chunk2read/`, `read2nova/`, and `output/`.
 
 ## What it deploys
 
@@ -34,6 +35,8 @@ The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with 
 | Read bucket | `read-use2-lukach-io`, private, encrypted, no versioning, retained on stack deletion |
 | FLEX bucket | `flex-use2-lukach-io`, private, encrypted, no versioning, automatically processes small test sets with FLEX |
 | Nova bucket | `nova-use2-lukach-io`, private, encrypted, no versioning, retained on stack deletion; contains only edited `.md` results |
+| Out bucket | `out-use2-lukach-io`, private, S3-managed encryption, SSL required, no versioning, retained on stack deletion; contains reassembled `.md` documents |
+| Lambda function | `output`, ZIP-based Python 3.13, ARM64, 15-minute timeout, 1 GiB memory, reserved concurrency 1, manual invocation only; no Docker image or extra layer |
 | Batch bucket | `batch-use2-lukach-io`, private, encrypted, no versioning, retained; holds all internal working files (prepared inputs, batch job inputs, raw outputs, manifests) |
 | SQS queue | `read2nova`, encrypted, 90-minute visibility timeout, 14-day retention |
 | SQS DLQ | `read2nova-dlq`, encrypted, receives messages after five unsuccessful receives, 14-day retention |
@@ -44,9 +47,9 @@ The implementation is centered on the AWS CDK stack in `scs/scs_stack.py`, with 
 | Bedrock service role | Scoped S3 input/output artifact access and Nova US inference-profile permissions |
 | EventBridge | Five-minute dispatch/reconciliation schedule and batch terminal-state notifications |
 | CloudWatch alarms | Batch/FLEX DLQs and queue age, workflow failure queue, and failed chunks |
-| CloudWatch Logs | One-month retention for all six functions, including `/aws/lambda/chunk2read` and `/aws/lambda/read2nova` |
+| CloudWatch Logs | One-month retention for all seven functions, including `/aws/lambda/chunk2read`, `/aws/lambda/read2nova`, and `/aws/lambda/output` |
 
-The original six buckets and their contents are configured for removal when the stack is destroyed. The read/FLEX/Nova buckets, all five Nova queues, and state table are retained so source objects, results, and pending work are not destroyed. No stack-managed bucket has versioning enabled. Overwriting an object replaces it without retaining an older version. Downloaded objects are replaced when the downloader runs again.
+The original six buckets and their contents are configured for removal when the stack is destroyed. The read/FLEX/Nova/batch/out buckets, all five Nova queues, and state table are retained so source objects, results, and pending work are not destroyed. No stack-managed bucket has versioning enabled. Overwriting an object replaces it without retaining an older version. Downloaded objects are replaced when the downloader runs again.
 
 ## Prerequisites
 
@@ -72,7 +75,7 @@ cdk bootstrap aws://ACCOUNT/us-east-2 --qualifier lukach
 cdk deploy --profile scs
 ```
 
-Replace `ACCOUNT` with the AWS account ID used for deployment. The stack is pinned to `us-east-2` and uses the CDK asset qualifier `lukach`, so the bootstrap environment must use that same qualifier. Deployment does not download or convert documents: the downloader, chunker, and `chunk2read` are manually invoked, while PDF conversion and splitting start only after an object is uploaded to their respective input buckets.
+Replace `ACCOUNT` with the AWS account ID used for deployment. The stack is pinned to `us-east-2` and uses the CDK asset qualifier `lukach`, so the bootstrap environment must use that same qualifier. Deployment does not download or convert documents: the downloader, chunker, `chunk2read`, and `output` are manually invoked, while PDF conversion and splitting start only after an object is uploaded to their respective input buckets.
 
 ## Download the documents
 
@@ -171,6 +174,37 @@ The function paginates all keys in `nova-use2-lukach-io` first, then scans all o
 The response reports counts, for example `{"read":200,"read_batches":2,"flex":50,"skipped_nova":30}`. Read/FLEX copies immediately trigger the existing paid inference pipeline. These are copy groups, not forced Bedrock job boundaries: the existing dispatcher still assembles 100-500 records per job according to `NovaBatchSize`.
 
 Nova exclusion uses the key listing at the start of the invocation. Run against a stable chunk set and wait for earlier inference runs to finish before invoking again; pending read/FLEX work without a Nova result is eligible to be copied again. Reserved concurrency prevents overlapping `chunk2read` executions, not other writers. S3 copies are not transactional: an error or the 15-minute Lambda timeout fails the invocation but leaves any completed copies in place, potentially including an incomplete read group. Inspect the Lambda error and pending inference work before rerunning; there is no automatic rollback or retry workflow.
+
+## Reassemble final Markdown with output
+
+Wait for all batch and FLEX inference to finish, then invoke `output` manually:
+
+```bash
+aws lambda invoke --function-name output \
+  --cli-binary-format raw-in-base64-out --payload '{}' \
+  --region us-east-2 --profile scs response.json
+
+cat response.json
+aws s3 ls s3://out-use2-lukach-io/ --recursive --region us-east-2 --profile scs
+aws s3 sync s3://out-use2-lukach-io/ ./out --region us-east-2 --profile scs
+```
+
+This ZIP-based Lambda has no S3 trigger, queue, schedule, Docker image, or extra layer. It lists the chunk bucket as the expected inventory and requires a matching Nova result for every Markdown chunk. Missing results or extra Nova Markdown keys fail the invocation before any documents are written; non-Markdown keys are ignored. Keep the chunk inventory intact until assembly finishes, and resolve stale keys if a document was rechunked with fewer chunks.
+
+The function groups the pipeline's numbered keys into original-document core names, sorts **numerically by PDF part and then by chunk**, and writes one lowercase `.md` output per document:
+
+| Nova keys | Out key |
+| --- | --- |
+| `guide-0001.md`, `guide-0002.md` | `guide.md` |
+| `large-0001-0001.md`, `large-0001-0002.md`, `large-0002-0001.md` | `large.md` |
+
+One trailing numeric suffix denotes a chunk; two denote a PDF part and chunk. Suffixes must have at least four digits and numbering must start at 1 without gaps. Unnumbered keys, duplicate numeric positions, or mixed split/unsplit keys for the same core name fail before any writes. Core names ending in a hyphen plus four or more digits are ambiguous under this convention; rename those source documents before chunking. Folder prefixes, if present in chunk/Nova keys, are preserved in out keys.
+
+Nova content is preserved byte-for-byte, including any preambles or continuation headings returned by inference, with two newline bytes inserted between chunks. Empty or unreadable results fail rather than publish that document. Each document is assembled in temporary storage, uploaded with Markdown content type, and the temporary file is closed afterward. The function can list chunk keys, read Nova objects, and write out objects; it does not modify or delete source files.
+
+A successful response looks like `{"bucket":"out-use2-lukach-io","documents":70,"chunks":1200}`. Rerunning replaces the same output keys; it does not delete older documents no longer in the inventory. Run against stable chunk and Nova buckets: reserved concurrency prevents overlapping `output` invocations, not other writers. Completeness is checked against the current chunk inventory and numbering, not the original PDFs; it cannot detect a trailing chunk or part removed from both inventories.
+
+Assembly is not a multi-document transaction. A read/upload error, exhausted temporary storage, or the 15-minute timeout fails the invocation, but documents already uploaded remain. Inspect the Lambda error and rerun after resolving the cause. A document must fit in the Lambda's default 512 MiB temporary storage; it is streamed rather than loaded wholly into memory. The out bucket retains final files on stack deletion and has no version history.
 
 ## Edit chunks with Nova 2 Lite batch inference
 

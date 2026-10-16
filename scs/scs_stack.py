@@ -112,6 +112,15 @@ class ScsStack(Stack):
             removal_policy = RemovalPolicy.RETAIN
         )
 
+        out_bucket = _s3.Bucket(
+            self, 'out_bucket',
+            bucket_name = 'out-use2-lukach-io',
+            encryption = _s3.BucketEncryption.S3_MANAGED,
+            block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl = True,
+            removal_policy = RemovalPolicy.RETAIN
+        )
+
         flex_bucket = _s3.Bucket(
             self, 'flex_bucket',
             bucket_name = 'flex-use2-lukach-io',
@@ -314,6 +323,39 @@ class ScsStack(Stack):
         _logs.LogGroup(
             self, 'chunk2read_logs',
             log_group_name = '/aws/lambda/'+chunk2read.function_name,
+            retention = _logs.RetentionDays.ONE_MONTH,
+            removal_policy = RemovalPolicy.DESTROY
+        )
+
+        output = _lambda.Function(
+            self, 'output',
+            function_name = 'output',
+            runtime = _lambda.Runtime.PYTHON_3_13,
+            architecture = _lambda.Architecture.ARM_64,
+            code = _lambda.Code.from_asset(
+                'output', exclude = ['__pycache__', '*.pyc']
+            ),
+            handler = 'output.handler',
+            environment = dict(
+                CHUNK_BUCKET = chunk_bucket.bucket_name,
+                NOVA_BUCKET = nova_bucket.bucket_name,
+                OUT_BUCKET = out_bucket.bucket_name
+            ),
+            timeout = Duration.seconds(900),
+            memory_size = 1024,
+            reserved_concurrent_executions = 1
+        )
+
+        output.add_to_role_policy(_iam.PolicyStatement(
+            actions = ['s3:ListBucket'],
+            resources = [chunk_bucket.bucket_arn]
+        ))
+        nova_bucket.grant_read(output)
+        out_bucket.grant_put(output)
+
+        _logs.LogGroup(
+            self, 'output_logs',
+            log_group_name = '/aws/lambda/'+output.function_name,
             retention = _logs.RetentionDays.ONE_MONTH,
             removal_policy = RemovalPolicy.DESTROY
         )
