@@ -332,7 +332,7 @@ class ScsStack(Stack):
         )
         max_output_tokens = CfnParameter(
             self, 'NovaMaxOutputTokens',
-            type = 'Number', default = 8000, min_value = 1, max_value = 64000,
+            type = 'Number', default = 16000, min_value = 1, max_value = 64000,
             description = 'Maximum output tokens reserved for each edit'
         )
         batch_size = CfnParameter(

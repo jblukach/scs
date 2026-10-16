@@ -139,7 +139,7 @@ class NovaStackTests(unittest.TestCase):
         self.assertEqual(template['Parameters']['NovaBatchSize']['Default'], 500)
         self.assertEqual(template['Parameters']['NovaBatchSize']['MinValue'], 100)
         self.assertEqual(template['Parameters']['NovaActiveJobs']['Default'], 2)
-        self.assertEqual(template['Parameters']['NovaMaxOutputTokens']['Default'], 8000)
+        self.assertEqual(template['Parameters']['NovaMaxOutputTokens']['Default'], 16000)
         for name in ('ChunkFailures', 'LowCondensation'):
             self.template.has_resource_properties('AWS::Logs::MetricFilter', {
                 'MetricTransformations': [Match.object_like({

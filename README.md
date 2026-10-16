@@ -223,7 +223,15 @@ Like `text2chunk`, this is a ZIP-based Python 3.13 ARM64 Lambda using the runtim
 
 ### Limits, failures, and recovery
 
-[Nova 2 Lite](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-2-lite.html) has a **1M-token context window and approximately 64K maximum output**, not 1M output tokens. `NovaMaxOutputTokens` defaults to 8000 and supports up to 64000. Condensed output for a 15,000-character chunk needs far fewer tokens, and the lower limit reduces FLEX quota reservations and bounds runaway responses; a response that reaches the limit fails as incomplete. This pipeline accepts at most 100,000 UTF-8 bytes per source chunk, keeping prepared batches well below the 1 GB input-file limit even with JSON escaping. The existing 15,000-character chunks fit comfortably. Larger sources fail registration for rechunking.
+[Nova 2 Lite](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-2-lite.html) has a **1M-token context window and approximately 64K maximum output**, not 1M output tokens. `NovaMaxOutputTokens` defaults to 16000 and supports up to 64000. The limit gives edits additional headroom while bounding runaway responses; a response that reaches the limit fails as incomplete. Higher limits increase FLEX quota reservations. This pipeline accepts at most 100,000 UTF-8 bytes per source chunk, keeping prepared batches well below the 1 GB input-file limit even with JSON escaping. The existing 15,000-character chunks fit comfortably. Larger sources fail registration for rechunking.
+
+For an existing stack, explicitly set the parameter when deploying; changing the code default alone does not replace a previously deployed parameter value:
+
+```bash
+cdk deploy ScsStack --parameters ScsStack:NovaMaxOutputTokens=16000 --profile scs
+```
+
+The updated limit applies to newly registered uploads. Existing prepared inputs retain the limit saved when they were registered.
 
 Automatic FLEX calls reserve UTF-8 byte counts plus prompt/framing overhead and the maximum output tokens against a persistent rolling-minute ledger. Defaults are `NovaRequestsPerMinute=10` and `NovaTokensPerMinute=100000`; these parameters **do not limit batch jobs**. They must fit the account's available on-demand quota, shared with other callers. FLEX uses a 780-second read timeout without SDK inference retries. Waiting is billable Lambda time, and SQS retries after timeouts may cause duplicate inference charges.
 
